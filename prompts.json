@@ -1,0 +1,37 @@
+{
+  "What is PanDA?": "DocumentQuery",
+  "Explain how I can run a job on the grid?": "DocumentQuery",
+  "How do I use prun?": "DocumentQuery",
+  "How do I use pathena?": "DocumentQuery",
+  "How do I submit a job to the grid?": "DocumentQuery",
+
+  "Why did job 123456 fail?": "LogAnalysis",
+  "Why has job 123456 failed?": "LogAnalysis",
+  "Why is job 123456 failing?": "LogAnalysis",
+  "Can you tell me why job 123456 failed?": "LogAnalysis",
+  "Do you know why job 123456 failed?": "LogAnalysis",
+  "Explain why job 123456 failed": "LogAnalysis",
+
+  "What happened to job 123456?": "LogAnalysis",
+  "What has happened to job 123456?": "LogAnalysis",
+  "What exactly happened with job 123456?": "LogAnalysis",
+  "Can you check what happened to job 123456?": "LogAnalysis",
+  "I want to know what happened to job 123456": "LogAnalysis",
+
+  "What went wrong with job 123456?": "LogAnalysis",
+  "What is wrong with job 123456?": "LogAnalysis",
+  "Something went wrong with job 123456, what is it?": "LogAnalysis",
+  "Can you see what went wrong with job 123456?": "LogAnalysis",
+  "What could have gone wrong with job 123456?": "LogAnalysis",
+
+  "Explain job 123456.": "MetadataAnalysis",
+  "Analyze job 123456.": "MetadataAnalysis",
+  "What is happening with job 123456?": "MetadataAnalysis",
+  "What is happening with task 123456?": "MetadataAnalysis",
+  "Explain why task 123456 failed": "MetadataAnalysis",
+  "Please summarize task 123456": "TaskQuery",
+
+  "Show me the status of queue ANALY_BNL_LONG": "QueueQuery",
+  "Are there any problems with pilots at BNL_SITE_XYZ?": "PilotMonitor",
+  "How does PanDA assign jobs to queues?": "DocumentQuery"
+}
