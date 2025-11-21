@@ -3,6 +3,10 @@
   "Explain how I can run a job on the grid?": "DocumentQuery",
   "How do I use prun?": "DocumentQuery",
   "How do I use pathena?": "DocumentQuery",
+  "What is prun?": "DocumentQuery",
+  "What is pathena?": "DocumentQuery",
+  "Explain prun?": "DocumentQuery",
+  "Explain pathena?": "DocumentQuery",
   "How do I submit a job to the grid?": "DocumentQuery",
 
   "Why did job 123456 fail?": "LogAnalysis",
@@ -33,5 +37,8 @@
 
   "Show me the status of queue ANALY_BNL_LONG": "QueueQuery",
   "Are there any problems with pilots at BNL_SITE_XYZ?": "PilotMonitor",
-  "How does PanDA assign jobs to queues?": "DocumentQuery"
+  "How does PanDA assign jobs to queues?": "DocumentQuery",
+  "PanDA is weird - why do I have to use it?": "DocumentQuery",
+  "What is DIRAC?": "DocumentQuery",
+  "Ugh": "DocumentQuery"
 }
