@@ -190,3 +190,39 @@ print("Handler:", result.reasoning.handler_name)
 print("Formatted answer:\n", result.formatted_answer)
 ```
 
+## Audio Input (Optional, in development)
+
+To use audio input, you need to provide a speech-to-text (STT) callable. A script
+mainly intended for testing is provided in the  `demo_audio.py` and `mic_demo.py` files.
+The code demonstrates how to turn audio into text, and is based on OpenAI's Whisper model, 
+but can be replaced with any STT system that matches the expected callable signature. 
+
+A correspondinf preliminary version of a Streamlit app is provided in `streamlit_mic_app.py`.
+
+
+## OpenAI Fine-Tuning
+
+The reasoning engine can produce structured JSON outputs that can be used to fine-tune
+OpenAI models for intent classification. This allows you to train a model to predict
+the appropriate handler based on user prompts, potentially improving routing accuracy
+over time.
+
+To generate fine-tuning data, you can modify the test harness to output JSONL files
+suitable for OpenAI fine-tuning. Each entry should include the prompt and the
+expected handler as the label.
+
+Example JSONL entry (not complete):
+
+```json
+{"prompt": "What is PanDA?", "completion": " DocumentQuery"}
+{"prompt": "Why did job 123456 fail?", "completion": " LogAnalysis"}
+``` 
+
+Initial JSONL files can be created like so:
+
+```bash
+python test_panda_reasoning_engine.py --input prompts.json --jsonl-output fine_tuning_data.json
+```
+
+
+
