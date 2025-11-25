@@ -1,4 +1,4 @@
-# Ask PanDA Reasoning Engine
+# Ask PanDA Reasoning Engine - R&D
 
 The Ask PanDA Reasoning Engine is a modular, transparent, and fully testable intent-routing 
 framework designed to power natural-language (and optional audio-based) interactions with 
