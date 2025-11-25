@@ -40,5 +40,13 @@
   "How does PanDA assign jobs to queues?": "DocumentQuery",
   "PanDA is weird - why do I have to use it?": "DocumentQuery",
   "What is DIRAC?": "DocumentQuery",
-  "Ugh": "DocumentQuery"
+
+  "Is the server alive?": "PandaMCP",
+  "Is pandaserver alive?": "PandaMCP",
+  "Is panda server alive?": "PandaMCP",
+  "Is the PanDA server alive?": "PandaMCP",
+  "Is PanDA server alive?": "PandaMCP",
+  "Is PanDA alive?": "PandaMCP",
+  "Is PanDA running?": "PandaMCP",
+  "Is PanDA server running?": "PandaMCP"
 }

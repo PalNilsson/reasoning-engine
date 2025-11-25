@@ -4,7 +4,7 @@ PanDA reasoning engine module.
 This module implements a lightweight, rule-based reasoning layer for Ask PanDA.
 It sits between the user interface (text or audio input) and a set of concrete
 clients (DocumentQuery, QueueQuery, TaskQuery, LogAnalysis, PilotMonitor,
-MetadataAnalysis, Selection).
+MetadataAnalysis, Selection, PandaMCP).
 
 The engine performs three main steps:
 
@@ -215,6 +215,7 @@ class PanDAReasoningEngine:
             "LogAnalysis": log_analysis,
             "PilotMonitor": pilot_monitor,
             "MetadataAnalysis": metadata_analysis,
+            "PandaMCP": panda_mcp,
         }
 
     # ------------------------------------------------------------------
@@ -487,6 +488,9 @@ class PanDAReasoningEngine:
         if intent == "metadata_analysis":
             return "MetadataAnalysis"
 
+        if intent == "panda_mcp":
+            return "PandaMCP"
+
         # Generic questions with job/task IDs → treat as metadata analysis
         if intent == "generic_question" and has_task_id:
             # Distinguish job vs task wording
@@ -526,6 +530,9 @@ class PanDAReasoningEngine:
 
         if handler_name == "MetadataAnalysis":
             return "Summarize current metadata and activity for the specified task or job."
+
+        if handler_name == "PandaMCP":
+            return "Execute a tool or function on the PanDA server."
 
         return "Provide a helpful answer to a general PanDA-related question."
 
@@ -623,6 +630,12 @@ class PanDAReasoningEngine:
                 "fetch_metadata",
                 "analyze_state_transitions",
                 "summarize_metadata_status",
+            ]
+
+        #
+        if handler_name == "PandaMCP":
+            return [
+                "is_alive",
             ]
 
         # Generic fallback
