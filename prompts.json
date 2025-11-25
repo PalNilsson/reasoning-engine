@@ -41,7 +41,6 @@
   "PanDA is weird - why do I have to use it?": "DocumentQuery",
   "What is DIRAC?": "DocumentQuery",
 
-  "Is the server alive?": "PandaMCP",
   "Is pandaserver alive?": "PandaMCP",
   "Is panda server alive?": "PandaMCP",
   "Is the PanDA server alive?": "PandaMCP",

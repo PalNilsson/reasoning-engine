@@ -99,6 +99,11 @@ class MetadataAnalysis(BaseDummyHandler):
 
     name = "MetadataAnalysis"
 
+class PandaMCP(BaseDummyHandler):
+    """Dummy handler emulating PandaMCP."""
+
+    name = "PandaMCP"
+
 
 class Selection:
     """Dummy selection component that may refine the chosen handler.
@@ -242,6 +247,7 @@ def build_engine() -> PanDAReasoningEngine:
     log_analysis = LogAnalysis()
     pilot_monitor = PilotMonitor()
     metadata_analysis = MetadataAnalysis()
+    panda_mcp = PandaMCP()
     selection = Selection()
 
     engine = PanDAReasoningEngine(
@@ -252,6 +258,7 @@ def build_engine() -> PanDAReasoningEngine:
         pilot_monitor=pilot_monitor,
         metadata_analysis=metadata_analysis,
         selection=selection,
+        panda_mcp=panda_mcp,
         stt_callable=None,  # audio not tested in this harness
     )
     return engine

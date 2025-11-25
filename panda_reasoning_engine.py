@@ -184,6 +184,7 @@ class PanDAReasoningEngine:
         log_analysis: Handler,
         pilot_monitor: Handler,
         metadata_analysis: Handler,
+        panda_mcp: Handler,
         selection: Selection,
         stt_callable: Optional[STTCallable] = None,
     ) -> None:
@@ -335,6 +336,12 @@ class PanDAReasoningEngine:
             Intent label.
         """
         has_task_id = bool(entities.get("task_ids"))
+
+        # PanDA server / MCP health checks
+        if any(kw in lowered for kw in ["panda", "pandaserver", "panda server"]) and any(
+                kw in lowered for kw in ["alive", "running", "up"]
+        ):
+            return "panda_mcp"
 
         # Log / failure questions about *jobs*
         if has_task_id and "job" in lowered and any(
@@ -532,7 +539,7 @@ class PanDAReasoningEngine:
             return "Summarize current metadata and activity for the specified task or job."
 
         if handler_name == "PandaMCP":
-            return "Execute a tool or function on the PanDA server."
+            return "Execute a tool or function on the PanDA server via PanDA MCP."
 
         return "Provide a helpful answer to a general PanDA-related question."
 
