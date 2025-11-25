@@ -242,12 +242,14 @@ python test_panda_reasoning_engine.py --input prompts.json --jsonl-output fine_t
 ```
 
 A second script can be used to loop over the prompts in the generated JSONL file and
-and query an LLM to produce a final fine-tuning dataset:
+and query an LLM to produce a more final fine-tuning dataset:
 
 ```bash
 python generate_finetuning_dataset.py --input fine_tuning_data.json --output openai_finetuning.jsonl --llm openai --model gpt-4-vision-preview
 ```
 
-(currently in progress, not all options are implemented and it will not contact the LLM just yet).
+Function arguments will need to be added manually based on the expected schema for each tool.
+
+(Currently in progress, not all options are implemented and it will not contact the LLM just yet).
 
 
