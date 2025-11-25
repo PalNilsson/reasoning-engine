@@ -1,609 +1,701 @@
+"""
+PanDA reasoning engine module.
+
+This module implements a lightweight, rule-based reasoning layer for Ask PanDA.
+It sits between the user interface (text or audio input) and a set of concrete
+clients (DocumentQuery, QueueQuery, TaskQuery, LogAnalysis, PilotMonitor,
+MetadataAnalysis, Selection).
+
+The engine performs three main steps:
+
+1. Perception:
+   - Normalize the raw user input (text).
+   - Classify the user's intent (documentation, queue status, log analysis, etc.).
+   - Extract simple entities (job IDs, task IDs, queue names).
+
+2. Reasoning:
+   - Select which client should handle the request.
+   - Infer a high-level goal for that client.
+   - Estimate a lightweight confidence score.
+   - Build a symbolic, high-level execution plan for the selected client
+     (e.g. ["identify_failing_jobs", "fetch_logs_for_jobs", ...]).
+
+3. Action:
+   - Call the selected client with the original prompt, entities and goal.
+   - Collect and wrap the result into an InteractionResult that can be logged
+     or rendered by the front-end.
+
+The clients themselves contain the actual domain-specific logic (MCP tools,
+PanDA API calls, log analysis, etc.). This engine is deliberately simple and
+transparent, so its decisions can be inspected, tested and evolved over time.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 
-TextInput = str
-AudioInput = Union[str, Path, bytes]
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
 
-Intent = Literal[
-    "documentation",
-    "queue_status",
-    "task_status",
-    "log_analysis",
-    "pilot_monitoring",
-    "metadata_analysis",
-    "generic_question",
-]
+AudioInput = Union[str, bytes]
+"""Audio input representation for STT callables.
+
+In practice this is usually a filesystem path to a WAV file, but the type
+is kept generic to allow alternative implementations.
+"""
 
 STTCallable = Callable[[AudioInput], str]
+"""Callable type for speech-to-text (STT) functions."""
+
+
+# ---------------------------------------------------------------------------
+# Client / handler protocols
+# ---------------------------------------------------------------------------
+
+
+class Handler(Protocol):
+    """Protocol for all concrete Ask PanDA handler clients."""
+
+    name: str
+
+    def handle_request(
+        self,
+        *,
+        prompt: str,
+        entities: Dict[str, Any],
+        goal: str,
+        confidence: float,
+    ) -> str:
+        """Handle a user request routed by the reasoning engine.
+
+        Args:
+            prompt: The original user prompt (plain text).
+            entities: Entities extracted during perception (job IDs, queues, etc.).
+            goal: High-level goal for this handler (e.g. "diagnose job failure").
+            confidence: Heuristic confidence in the routing decision.
+
+        Returns:
+            A formatted string answer ready to render to the user.
+        """
+        ...
+
+
+class Selection(Protocol):
+    """Protocol for a selection client that may override handler choice."""
+
+    def select_handler(
+        self,
+        *,
+        prompt: str,
+        heuristic_candidate: str,
+        entities: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """Optionally override the heuristic handler choice.
+
+        Args:
+            prompt: Original user prompt.
+            heuristic_candidate: Name of the handler chosen by built-in rules.
+            entities: Extracted entities.
+
+        Returns:
+            A mapping with at least the key "handler_name", potentially
+            containing additional information in the future.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class Perception:
-    """Structured view of the user request after the perception step.
+    """Result of the perception step.
 
     Attributes:
-        raw_text: Canonical textual representation of the user request.
-        intent: High-level intent label inferred by the perception step.
-        entities: Extracted PanDA-related entities (task IDs, queues, sites, etc.).
-        metadata: Additional perception metadata (e.g., length, flags).
+        raw_text: Original user query as text.
+        intent: Classified intent label.
+        entities: Extracted entities (job/task IDs, queue names, etc.).
+        metadata: Miscellaneous metadata (token count, flags, etc.).
     """
 
     raw_text: str
-    intent: Intent
-    entities: Dict[str, List[str]]
-    metadata: Dict[str, Any]
+    intent: str
+    entities: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class ReasoningState:
-    """Reasoning state for a single Ask PanDA interaction.
+class Reasoning:
+    """Result of the reasoning step.
 
     Attributes:
-        goal: Natural-language statement of what the assistant is trying to achieve.
-        handler_name: Name of the selected PanDA handler (e.g., "TaskQuery").
-        confidence: Confidence score in the selected intent/handler.
-        perception: Perception instance that this reasoning state is based on.
+        goal: High-level goal for the selected handler.
+        handler_name: Name of the handler that should process the request.
+        confidence: Heuristic confidence score in [0.0, 1.0].
+        plan: Symbolic ordered steps the handler is expected to perform.
     """
 
     goal: str
     handler_name: str
     confidence: float
-    perception: Perception
+    plan: List[str] = field(default_factory=list)
 
 
 @dataclass
 class InteractionResult:
-    """Container for the full result of one Ask PanDA reasoning pass.
+    """Full outcome of handling a user interaction.
 
     Attributes:
-        perception: Perception object describing how the request was understood.
-        reasoning: ReasoningState describing the selected handler and goal.
-        handler_response: Raw response object returned by the selected handler.
-        formatted_answer: Optional formatted answer ready for display in the UI.
+        perception: Perception result (intent + entities).
+        reasoning: Reasoning result (goal + handler + plan).
+        handler_output: Raw output string from the handler client.
+        formatted_answer: Final formatted answer for rendering/logging.
     """
 
     perception: Perception
-    reasoning: ReasoningState
-    handler_response: Any
-    formatted_answer: Optional[str] = None
+    reasoning: Reasoning
+    handler_output: str
+    formatted_answer: str
+
+
+# ---------------------------------------------------------------------------
+# PanDA Reasoning Engine
+# ---------------------------------------------------------------------------
 
 
 class PanDAReasoningEngine:
-    """Reasoning engine for Ask PanDA with optional audio input.
+    """Rule-based reasoning engine for Ask PanDA.
 
-    This engine sits in front of the various PanDA handlers and implements a
-    simple perceive → reason → act loop:
-
-      * Perceive: infer intent and extract basic entities from the request text.
-      * Reason: map intent + entities to a goal and select the appropriate handler.
-      * Act: delegate the actual work to the selected handler.
-
-    The engine supports both text and audio input. Audio input is converted
-    to text via an injected speech-to-text callable, after which all processing
-    is text-based. Handlers encapsulate their own internal logic; the reasoning
-    engine only decides which handler to use and exposes a transparent routing
-    explanation that can be shown in the UI.
+    The engine wires together several domain-specific clients and provides
+    a uniform interface for text and (optional) audio-based queries.
     """
 
     def __init__(
         self,
         *,
-        document_query: Any,
-        queue_query: Any,
-        task_query: Any,
-        log_analysis: Any,
-        pilot_monitor: Any,
-        metadata_analysis: Any,
-        selection: Optional[Any] = None,
+        document_query: Handler,
+        queue_query: Handler,
+        task_query: Handler,
+        log_analysis: Handler,
+        pilot_monitor: Handler,
+        metadata_analysis: Handler,
+        selection: Selection,
         stt_callable: Optional[STTCallable] = None,
     ) -> None:
-        """Initialize the reasoning engine with PanDA handlers and STT.
+        """Initialize the reasoning engine with concrete handler clients.
 
         Args:
-            document_query: Handler used for documentation / static knowledge
-                queries (for example, ``DocumentQuery``).
-            queue_query: Handler that answers queue/site information queries
-                (for example, ``QueueQuery``).
-            task_query: Handler that answers task and job status queries
-                (for example, ``TaskQuery``).
-            log_analysis: Handler that performs log and failure analysis
-                (for example, ``LogAnalysis``).
-            pilot_monitor: Handler that answers pilot-related questions
-                (for example, ``PilotMonitor``).
-            metadata_analysis: Handler that performs metadata-level analysis for
-                tasks or jobs (for example, ``MetadataAnalysis``).
-            selection: Optional Selection component used as a fallback to refine
-                heuristic routing decisions. It is expected to expose a
-                ``select_handler`` method.
-            stt_callable: Optional function that converts audio input to text.
-                It should accept an ``AudioInput`` and return the transcribed
-                text as a string.
+            document_query: Client used for documentation and how-to questions.
+            queue_query: Client used for queue/site status and properties.
+            task_query: Client used for task-level queries.
+            log_analysis: Client used for job failure and log analysis.
+            pilot_monitor: Client used for pilot status and anomalies.
+            metadata_analysis: Client used for job/task metadata analysis.
+            selection: Client responsible for optional handler overrides.
+            stt_callable: Optional speech-to-text function for audio input.
         """
-        self.document_query = document_query
-        self.queue_query = queue_query
-        self.task_query = task_query
-        self.log_analysis = log_analysis
-        self.pilot_monitor = pilot_monitor
-        self.metadata_analysis = metadata_analysis
-        self.selection = selection
-        self.stt_callable = stt_callable
+        self._document_query = document_query
+        self._queue_query = queue_query
+        self._task_query = task_query
+        self._log_analysis = log_analysis
+        self._pilot_monitor = pilot_monitor
+        self._metadata_analysis = metadata_analysis
+        self._selection = selection
+        self._stt_callable = stt_callable
 
-    # -------------------------------------------------------------------------
-    # Public entry points
-    # -------------------------------------------------------------------------
+        self._handlers: Dict[str, Handler] = {
+            "DocumentQuery": document_query,
+            "QueueQuery": queue_query,
+            "TaskQuery": task_query,
+            "LogAnalysis": log_analysis,
+            "PilotMonitor": pilot_monitor,
+            "MetadataAnalysis": metadata_analysis,
+        }
 
-    def handle_text(self, prompt: TextInput) -> InteractionResult:
-        """Handle a single Ask PanDA request from a text prompt.
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def handle_text(self, prompt: str) -> InteractionResult:
+        """Handle a text query.
 
         Args:
-            prompt: User's textual query.
+            prompt: User query as plain text.
 
         Returns:
-            InteractionResult: Full interaction result with perception, reasoning
-            and handler response.
+            InteractionResult containing perception, reasoning and handler output.
         """
-        perception = self._perceive_text(prompt)
+        perception = self._perceive(prompt)
         reasoning = self._reason(perception)
-        handler_response = self._act(reasoning)
-        formatted_answer = self._format_answer(handler_response, reasoning)
+        handler_output = self._execute_handler(
+            reasoning.handler_name, prompt, perception, reasoning
+        )
+        formatted = self._format_answer(perception, reasoning, handler_output)
         return InteractionResult(
             perception=perception,
             reasoning=reasoning,
-            handler_response=handler_response,
-            formatted_answer=formatted_answer,
+            handler_output=handler_output,
+            formatted_answer=formatted,
         )
 
     def handle_audio(self, audio: AudioInput) -> InteractionResult:
-        """Handle a single Ask PanDA request from audio input.
-
-        Audio is converted to text via the configured STT callable before running
-        the normal perceive → reason → act pipeline.
+        """Handle an audio query via the configured STT callable.
 
         Args:
-            audio: Audio input (for example, a file path or raw bytes) to be
-                transcribed.
+            audio: Audio input (typically a path to a WAV file).
 
         Returns:
-            InteractionResult: Full interaction result with perception, reasoning
-            and handler response.
+            InteractionResult as for :meth:`handle_text`.
 
         Raises:
-            RuntimeError: If no STT callable has been configured.
+            RuntimeError: If no STT callable is configured.
         """
-        if self.stt_callable is None:
-            raise RuntimeError(
-                "No STT callable configured on PanDAReasoningEngine; "
-                "audio input handling is not available."
-            )
+        if self._stt_callable is None:
+            raise RuntimeError("No STT callable configured for audio handling.")
 
-        text = self.stt_callable(audio)
+        text = self._stt_callable(audio)
         return self.handle_text(text)
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Perception
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    def _perceive_text(self, prompt: str) -> Perception:
-        """Derive intent and entities from the raw text prompt.
-
-        This method uses lightweight, deterministic rules. It can be extended or
-        combined with a Selection component if richer understanding is required
-        for ambiguous queries.
+    def _perceive(self, prompt: str) -> Perception:
+        """Perform simple perception: intent classification and entity extraction.
 
         Args:
-            prompt: User's textual query.
+            prompt: User query as plain text.
 
         Returns:
-            Perception: Structured perception object.
+            Perception object with intent, entities and metadata.
         """
-        normalized = prompt.strip()
-        intent = self._infer_intent(normalized)
-        entities = self._extract_entities(normalized)
+        text = prompt.strip()
+        lowered = text.lower()
+
+        entities = self._extract_entities(lowered)
+        intent = self._classify_intent(lowered, entities)
+
         metadata: Dict[str, Any] = {
-            "length": len(normalized.split()),
+            "length": len(text.split()),
             "has_task_id": bool(entities.get("task_ids")),
             "has_queue": bool(entities.get("queues")),
         }
+
         return Perception(
-            raw_text=normalized,
+            raw_text=text,
             intent=intent,
             entities=entities,
             metadata=metadata,
         )
 
-    def _infer_intent(self, text: str) -> Intent:
-        """Infer a high-level intent label from the given text.
-
-        The rules in this method are intentionally explicit and biased towards
-        clarity rather than cleverness. They distinguish carefully between:
-
-        * Job vs task questions (jobs have logs; tasks do not).
-        * Failure-oriented queries (routed to log analysis for jobs, but to
-          metadata analysis for tasks).
-        * Documentation-style questions about how PanDA works.
-        * Queue/site status vs pilot monitoring vs metadata vs logs.
+    def _extract_entities(self, lowered: str) -> Dict[str, Any]:
+        """Extract simple entities (job/task IDs, queue names) via regex.
 
         Args:
-            text: User's normalized request text.
+            lowered: Lowercase user query.
 
         Returns:
-            Intent: Coarse intent label used for routing to handlers.
+            Dictionary with extracted entities.
         """
-        lower = text.lower()
+        entities: Dict[str, Any] = {}
 
-        # Basic helpers
-        job_present = "job" in lower
-        task_present = "task" in lower
+        # Job / task IDs (simple numeric heuristic)
+        id_matches = re.findall(r"\b\d{5,}\b", lowered)
+        if id_matches:
+            entities["task_ids"] = id_matches
 
-        import re
+        # Queue names (very simplified; adapt to your real queue naming rules)
+        queue_matches = re.findall(r"\b[a-z0-9_]{4,}\b", lowered)
+        # Filter out obvious non-queue tokens if needed; here we keep everything.
+        entities["queues"] = queue_matches
 
-        ids = re.findall(r"\b\d{4,}\b", lower)
-        has_id = len(ids) > 0
+        return entities
 
-        # ------------------------------------------------------------------
-        # 1) "Why ..." logic
-        # ------------------------------------------------------------------
-        if "why" in lower:
-            if job_present:
-                return "log_analysis"
-            if task_present:
-                return "metadata_analysis"
+    def _classify_intent(
+        self,
+        lowered: str,
+        entities: Dict[str, Any],
+    ) -> str:
+        """Classify the user's intent based on simple keyword rules.
 
-        # ------------------------------------------------------------------
-        # 2) "What happened / what went wrong"
-        #     Jobs -> logs, tasks -> metadata
-        # ------------------------------------------------------------------
-        what_happened_phrases = [
-            "what happened",
-            "what has happened",
-            "what exactly happened",
-            "check what happened",
-            "know what happened",
-        ]
-        went_wrong_phrases = [
-            "went wrong",
-            "what went wrong",
-            "wrong with",
-        ]
+        This is intentionally simple and deterministic so that it can be
+        unit-tested and iterated without model calls.
 
-        if any(p in lower for p in what_happened_phrases) or any(
-            p in lower for p in went_wrong_phrases
+        Args:
+            lowered: Lowercase user query.
+            entities: Extracted entities.
+
+        Returns:
+            Intent label.
+        """
+        has_task_id = bool(entities.get("task_ids"))
+
+        # Log / failure questions about *jobs*
+        if has_task_id and "job" in lowered and any(
+            kw in lowered
+            for kw in [
+                "why did",
+                "why has",
+                "why is",
+                "went wrong",
+                "what happened",
+                "has happened",
+                "fail",
+                "failed",
+                "failing",
+                "error",
+            ]
         ):
-            if job_present:
-                return "log_analysis"
-            if task_present:
-                return "metadata_analysis"
+            return "log_analysis"
 
-        # ------------------------------------------------------------------
-        # 3) Direct job/task analysis: "explain job 1234", "analyze task 1234"
-        #    Only when we have an ID and the verb directly modifies job/task.
-        # ------------------------------------------------------------------
-        direct_analysis_patterns = [
-            "explain job",
-            "explain task",
-            "analyze job",
-            "analyze task",
-            "analysis of job",
-            "analysis of task",
-            "describe job",
-            "describe task",
-            "inspect job",
-            "inspect task",
-        ]
-        if has_id and any(p in lower for p in direct_analysis_patterns):
+
+        # Simple task summary requests (route to TaskQuery)
+        if has_task_id and "task" in lowered and any(
+            kw in lowered
+            for kw in [
+                "summarize",
+                "summary",
+                "overview",
+            ]
+        ):
+            return "task_query"
+
+        # Task-level explanation / status (metadata analysis)
+        if has_task_id and "task" in lowered and any(
+            kw in lowered
+            for kw in [
+                "explain",
+                "what is happening",
+                "what's happening",
+                "status",
+            ]
+        ):
             return "metadata_analysis"
 
-        # ------------------------------------------------------------------
-        # 4) "What is happening with job|task" → metadata_analysis
-        # ------------------------------------------------------------------
-        if "what is happening with" in lower or "what's happening with" in lower:
-            if job_present or task_present:
-                return "metadata_analysis"
+        # Queue / site / pilot status
+        if any(kw in lowered for kw in ["queue", "site", "pilot"]):
+            if "pilot" in lowered:
+                return "pilot_status"
+            # Avoid hijacking conceptual "how does PanDA ..." questions
+            if not ("how does" in lowered and "panda" in lowered):
+                return "queue_status"
 
-        # ------------------------------------------------------------------
-        # 5) Task/job status queries ("status", "summarize", "summary")
-        # ------------------------------------------------------------------
-        if (job_present or task_present) and any(
-            kw in lower for kw in ["status", "summarize", "summary"]
-        ):
-            return "task_status"
 
-        # ------------------------------------------------------------------
-        # 6) Pilot queries
-        # ------------------------------------------------------------------
-        if "pilot" in lower:
-            return "pilot_monitoring"
-
-        # ------------------------------------------------------------------
-        # 7) Documentation / conceptual "how does / how do i / how can i / what is"
-        # ------------------------------------------------------------------
-        if any(
-            kw in lower
+        # Documentation / how-to (no specific task/job ID)
+        if not has_task_id and any(
+            kw in lowered
             for kw in [
-                "how does",
                 "how do i",
                 "how can i",
-                "what is",
-                "documentation",
-                "manual",
+                "how to",
+                "how does panda",
+                "how does pand",
+                "explain",
+                "what is panda",
+                "what is pand",
+                "prun",
+                "pathena",
+                "submit a job",
             ]
         ):
             return "documentation"
 
-        # ------------------------------------------------------------------
-        # 8) Queue / site status questions
-        # ------------------------------------------------------------------
-        queue_words = ["queue", "site"]
-        status_words = ["status", "state", "health", "usage", "load", "backlog"]
 
-        if any(q in lower for q in queue_words) and any(
-            s in lower for s in status_words
+        # Task/job status questions that are not clearly failure-related
+        if has_task_id and any(
+            kw in lowered
+            for kw in [
+                "what is happening",
+                "what's happening",
+                "status",
+                "explain job",
+                "explain task",
+                "analyze job",
+                "analyze task",
+            ]
         ):
-            return "queue_status"
+            return "metadata_analysis"
 
-        # ------------------------------------------------------------------
-        # 9) Generic logs/failures (no explicit job/task routing)
-        # ------------------------------------------------------------------
-        if any(
-            kw in lower
-            for kw in ["log", "error", "failure", "crash", "aborted", "killed"]
-        ):
-            return "log_analysis"
 
+        # Fallback generic
         return "generic_question"
 
-    def _extract_entities(self, text: str) -> Dict[str, List[str]]:
-        """Extract PanDA-relevant entities from the text.
+    # ------------------------------------------------------------------
+    # Reasoning and planning
+    # ------------------------------------------------------------------
 
-        This is a placeholder for progressively richer entity recognition
-        (task IDs, job IDs, queues, sites, experiments, etc.). It can be
-        extended to support more realistic patterns or replaced by a more
-        sophisticated NER component later.
-
-        Args:
-            text: User's textual request.
-
-        Returns:
-            Dict[str, List[str]]: Mapping from entity type to a list of values.
-        """
-        import re
-
-        entities: Dict[str, List[str]] = {}
-
-        # Example: numeric IDs (task/job IDs)
-        task_ids = re.findall(r"\b\d{4,}\b", text)
-        if task_ids:
-            entities["task_ids"] = task_ids
-
-        # Example: PanDA queues (very rough; adapt to your actual naming)
-        queues = re.findall(r"\b(A-T[A-Z0-9-]+|ANALY_[A-Z0-9_-]+)\b", text)
-        if queues:
-            entities["queues"] = queues
-
-        # Example: sites (placeholder pattern)
-        sites = re.findall(r"\b[A-Z]{2,}[_-]SITE[_-][A-Z0-9]+\b", text)
-        if sites:
-            entities["sites"] = sites
-
-        experiments = []
-        for exp_name in ["ATLAS", "ePIC", "EPIC", "RUBIN", "Vera Rubin"]:
-            if exp_name.lower() in text.lower():
-                experiments.append(exp_name)
-        if experiments:
-            entities["experiments"] = experiments
-
-        return entities
-
-    # -------------------------------------------------------------------------
-    # Reasoning
-    # -------------------------------------------------------------------------
-
-    def _reason(self, perception: Perception) -> ReasoningState:
-        """Construct a reasoning state from the perception.
+    def _reason(self, perception: Perception) -> Reasoning:
+        """Select a handler, infer a goal, estimate confidence, and build a plan.
 
         Args:
-            perception: Perception object describing how the request was parsed.
+            perception: Perception result from :meth:`_perceive`.
 
         Returns:
-            ReasoningState: Reasoning state with goal, selected handler and
-            confidence score.
+            Reasoning object.
         """
-        goal = self._identify_goal(perception)
-        handler_name = self._select_handler_name(perception)
-        confidence = self._estimate_confidence(perception, handler_name)
-        return ReasoningState(
+        heuristic_handler = self._heuristic_handler_choice(perception)
+        overridden = self._selection.select_handler(
+            prompt=perception.raw_text,
+            heuristic_candidate=heuristic_handler,
+            entities=perception.entities,
+        )
+
+        handler_name = overridden.get("handler_name", heuristic_handler)
+        goal = self._infer_goal(handler_name, perception.intent)
+        confidence = self._estimate_confidence(handler_name, perception)
+        plan = self._build_plan(handler_name, perception)
+
+        return Reasoning(
             goal=goal,
             handler_name=handler_name,
             confidence=confidence,
-            perception=perception,
+            plan=plan,
         )
 
-    def _identify_goal(self, perception: Perception) -> str:
-        """Map the perceived intent and entities to a goal description.
+    def _heuristic_handler_choice(self, perception: Perception) -> str:
+        """Choose a handler based on intent and entities using simple rules.
 
         Args:
-            perception: Perception associated with the current request.
+            perception: Perception result.
 
         Returns:
-            str: Human-readable goal statement.
+            Name of the handler that should handle the request.
         """
         intent = perception.intent
+        has_task_id = bool(perception.entities.get("task_ids"))
+
         if intent == "documentation":
-            return "Answer a documentation or how-to question about PanDA."
+            return "DocumentQuery"
+
         if intent == "queue_status":
-            return (
-                "Summarize the status and properties of the requested queues or sites."
-            )
-        if intent == "task_status":
-            return "Explain the status and health of a specific PanDA task and its jobs."
+            return "QueueQuery"
+
+        if intent == "task_query":
+            return "TaskQuery"
+
+        if intent == "pilot_status":
+            return "PilotMonitor"
+
         if intent == "log_analysis":
-            return "Diagnose failing jobs and identify likely error patterns."
-        if intent == "pilot_monitoring":
-            return (
-                "Describe pilot activity and any observed issues for relevant sites."
-            )
+            return "LogAnalysis"
+
         if intent == "metadata_analysis":
-            return (
-                "Summarize current metadata and activity for the specified task or job."
-            )
-        return "Provide a helpful answer to a general PanDA-related question."
+            return "MetadataAnalysis"
 
-    def _select_handler_name(self, perception: Perception) -> str:
-        """Select the PanDA handler name to handle the request.
+        # Generic questions with job/task IDs → treat as metadata analysis
+        if intent == "generic_question" and has_task_id:
+            # Distinguish job vs task wording
+            lowered = perception.raw_text.lower()
+            if "task" in lowered:
+                return "MetadataAnalysis"
+            if "job" in lowered:
+                return "LogAnalysis"
 
-        This method performs heuristic routing based on the intent and entities.
-        If a Selection component is configured, it may refine or override the
-        heuristic choice by calling its ``select_handler`` method.
+        # Default fallback
+        return "DocumentQuery"
+
+    def _infer_goal(self, handler_name: str, intent: str) -> str:
+        """Infer a high-level goal string for the selected handler.
 
         Args:
+            handler_name: Name of the selected handler.
+            intent: Classified intent label.
+
+        Returns:
+            Human-readable goal description.
+        """
+        if handler_name == "DocumentQuery":
+            return "Answer a documentation or how-to question about PanDA."
+
+        if handler_name == "QueueQuery":
+            return "Summarize the status and properties of the requested queues or sites."
+
+        if handler_name == "TaskQuery":
+            return "Summarize the current state and health of the requested task."
+
+        if handler_name == "LogAnalysis":
+            return "Diagnose failing jobs and identify likely error patterns."
+
+        if handler_name == "PilotMonitor":
+            return "Describe recent pilot activity and detect anomalies at the requested sites."
+
+        if handler_name == "MetadataAnalysis":
+            return "Summarize current metadata and activity for the specified task or job."
+
+        return "Provide a helpful answer to a general PanDA-related question."
+
+    def _estimate_confidence(self, handler_name: str, perception: Perception) -> float:
+        """Estimate a heuristic confidence score in [0.0, 1.0].
+
+        This score is intentionally simple; it is mainly useful for:
+        - logging and monitoring routing quality over time;
+        - deciding when to fall back to an LLM-based router if desired.
+
+        Args:
+            handler_name: Name of the selected handler.
+            perception: Perception result.
+
+        Returns:
+            Confidence score.
+        """
+        base = 0.6
+
+        # Small bonuses for clear signals
+        if perception.intent in ("log_analysis", "metadata_analysis", "queue_status"):
+            base += 0.1
+
+        # If we have a task/job ID for failure or metadata questions, increase confidence
+        if perception.entities.get("task_ids") and perception.intent in (
+            "log_analysis",
+            "metadata_analysis",
+        ):
+            base += 0.1
+
+        # Clip to [0.0, 1.0]
+        return max(0.0, min(1.0, base))
+
+    def _build_plan(self, handler_name: str, perception: Perception) -> List[str]:
+        """Construct a symbolic high-level plan for the selected handler.
+
+        The plan is a list of conceptual step names the handler is expected
+        to perform. The handler implementation is responsible for mapping
+        these steps to actual tool calls and logic.
+
+        Args:
+            handler_name: Name of the selected handler (e.g. "LogAnalysis").
             perception: Perception describing the request.
 
         Returns:
-            str: Name of the selected handler (for example, ``TaskQuery``).
+            List of step names in execution order.
         """
-        if perception.intent == "documentation":
-            candidate = "DocumentQuery"
-        elif perception.intent == "queue_status":
-            candidate = "QueueQuery"
-        elif perception.intent == "task_status":
-            candidate = "TaskQuery"
-        elif perception.intent == "log_analysis":
-            candidate = "LogAnalysis"
-        elif perception.intent == "pilot_monitoring":
-            candidate = "PilotMonitor"
-        elif perception.intent == "metadata_analysis":
-            candidate = "MetadataAnalysis"
-        else:
-            candidate = "DocumentQuery"
+        # Documentation / how-to
+        if handler_name == "DocumentQuery":
+            return [
+                "interpret_question",
+                "retrieve_relevant_docs",
+                "synthesize_answer",
+            ]
 
-        if self.selection is not None:
-            try:
-                selection_result = self.selection.select_handler(
-                    prompt=perception.raw_text,
-                    heuristic_candidate=candidate,
-                    entities=perception.entities,
-                )
-                return selection_result.get("handler_name", candidate)
-            except Exception:
-                # In testing and production we prefer robustness: fall back to
-                # the heuristic rather than failing the entire request.
-                return candidate
+        # Queue / site status
+        if handler_name == "QueueQuery":
+            return [
+                "identify_queues",
+                "fetch_queue_status",
+                "summarize_status",
+            ]
 
-        return candidate
+        # Task-level queries (if you later introduce a dedicated TaskQuery handler)
+        if handler_name == "TaskQuery":
+            return [
+                "identify_task",
+                "fetch_task_metadata",
+                "fetch_task_job_summary",
+                "summarize_task_health",
+            ]
 
-    def _estimate_confidence(self, perception: Perception, handler_name: str) -> float:
-        """Estimate the confidence in the routing decision.
+        # Job log analysis / failure diagnosis
+        if handler_name == "LogAnalysis":
+            return [
+                "identify_failing_jobs",
+                "fetch_logs_for_jobs",
+                "analyze_failure_patterns",
+                "produce_diagnostic_summary",
+            ]
+
+        # Pilot state / pilot anomalies
+        if handler_name == "PilotMonitor":
+            return [
+                "identify_relevant_sites",
+                "fetch_pilot_metrics",
+                "detect_anomalies",
+                "summarize_pilot_activity",
+            ]
+
+        # Task/job metadata analysis (non-log)
+        if handler_name == "MetadataAnalysis":
+            return [
+                "identify_task_or_job",
+                "fetch_metadata",
+                "analyze_state_transitions",
+                "summarize_metadata_status",
+            ]
+
+        # Generic fallback
+        return ["interpret_question", "route_to_best_handler", "synthesize_answer"]
+
+    # ------------------------------------------------------------------
+    # Execution and formatting
+    # ------------------------------------------------------------------
+
+    def _execute_handler(
+        self,
+        handler_name: str,
+        prompt: str,
+        perception: Perception,
+        reasoning: Reasoning,
+    ) -> str:
+        """Execute the selected handler client.
 
         Args:
-            perception: Perception object associated with the current request.
-            handler_name: Name of the selected handler.
+            handler_name: Name of the handler to invoke.
+            prompt: Original user prompt.
+            perception: Perception result.
+            reasoning: Reasoning result.
 
         Returns:
-            float: Confidence score between 0.0 and 1.0.
+            Raw output from the handler's :meth:`handle_request`.
         """
-        score = 0.6
-
-        if perception.entities.get("task_ids") and handler_name in (
-            "TaskQuery",
-            "MetadataAnalysis",
-        ):
-            score += 0.2
-
-        if perception.entities.get("queues") and handler_name == "QueueQuery":
-            score += 0.15
-
-        if perception.intent == "log_analysis" and handler_name == "LogAnalysis":
-            score += 0.15
-
-        length = perception.metadata.get("length", 0)
-        if length < 3 or length > 80:
-            score -= 0.1
-
-        return max(0.0, min(1.0, score))
-
-    # -------------------------------------------------------------------------
-    # Action
-    # -------------------------------------------------------------------------
-
-    def _act(self, reasoning: ReasoningState) -> Any:
-        """Delegate to the selected PanDA handler.
-
-        The selected handler is responsible for its internal steps. The engine
-        passes contextual information (prompt, entities, goal, confidence) so
-        that the handler can decide how to process the request.
-
-        Args:
-            reasoning: ReasoningState containing the goal, handler and confidence.
-
-        Returns:
-            Any: Raw response object returned by the selected handler.
-        """
-        handler = self._resolve_handler(reasoning.handler_name)
-        prompt = reasoning.perception.raw_text
-        entities = reasoning.perception.entities
+        handler = self._handlers.get(handler_name)
+        if handler is None:
+            # This should not happen in normal operation; treat as a fallback.
+            return (
+                f"[Error] No handler registered under name '{handler_name}'. "
+                f"Cannot process request."
+            )
 
         return handler.handle_request(
             prompt=prompt,
-            entities=entities,
+            entities=perception.entities,
             goal=reasoning.goal,
             confidence=reasoning.confidence,
         )
 
-    def _resolve_handler(self, handler_name: str) -> Any:
-        """Return the concrete handler instance for a given handler name.
+    def _format_answer(
+        self,
+        perception: Perception,
+        reasoning: Reasoning,
+        handler_output: str,
+    ) -> str:
+        """Format a final answer string for logging or display.
 
         Args:
-            handler_name: Name of the handler (for example, ``TaskQuery``).
+            perception: Perception result.
+            reasoning: Reasoning result.
+            handler_output: Raw output from the handler.
 
         Returns:
-            Any: Handler instance.
-
-        Raises:
-            ValueError: If the handler name is unknown.
+            Formatted multi-line string.
         """
-        if handler_name == "DocumentQuery":
-            return self.document_query
-        if handler_name == "QueueQuery":
-            return self.queue_query
-        if handler_name == "TaskQuery":
-            return self.task_query
-        if handler_name == "LogAnalysis":
-            return self.log_analysis
-        if handler_name == "PilotMonitor":
-            return self.pilot_monitor
-        if handler_name == "MetadataAnalysis":
-            return self.metadata_analysis
-        raise ValueError(f"Unknown handler_name: {handler_name!r}")
+        lines: List[str] = []
 
-    # -------------------------------------------------------------------------
-    # Answer formatting
-    # -------------------------------------------------------------------------
-
-    def _format_answer(self, handler_response: Any, reasoning: ReasoningState) -> str:
-        """Format a handler response into a UI-ready answer.
-
-        In many cases, the underlying handler already returns a nicely formatted
-        string. This method exists as a central place to add optional decorations
-        such as routing summaries, disclaimers, or links.
-
-        Args:
-            handler_response: Raw response returned by the handler.
-            reasoning: ReasoningState that led to this response.
-
-        Returns:
-            str: Final string to display in the Ask PanDA UI.
-        """
-        if isinstance(handler_response, str):
-            core = handler_response
-        else:
-            core = str(handler_response)
-
-        header = (
-            f"[Routing] intent={reasoning.perception.intent}, "
+        lines.append(
+            f"[Routing] intent={perception.intent}, "
             f"handler={reasoning.handler_name}, "
             f"confidence={reasoning.confidence:.2f}"
         )
-        return f"{header}\n\n{core}"
+
+        if reasoning.plan:
+            lines.append("")
+            lines.append("[Plan]")
+            for idx, step in enumerate(reasoning.plan, start=1):
+                lines.append(f"  {idx}. {step}")
+
+        lines.append("")
+        lines.append(handler_output)
+
+        return "\n".join(lines)

@@ -257,6 +257,132 @@ def build_engine() -> PanDAReasoningEngine:
     return engine
 
 
+def _step_to_tool_name(step: str) -> Optional[str]:
+    """Map high-level plan step names to concrete tool names.
+
+    The returned name should match the tools namespace used in your
+    fine-tuning schema, e.g. 'functions.metadata_search'.
+
+    Steps that do not correspond to an actual tool call should return None.
+    """
+    mapping = {
+        # Documentation / context retrieval
+        "retrieve_relevant_docs": "functions.context_retrieve",
+        # Metadata / status lookups
+        "fetch_metadata": "functions.metadata_search",
+        "fetch_task_metadata": "functions.metadata_search",
+        "fetch_task_job_summary": "functions.metadata_search",
+        "identify_failing_jobs": "functions.metadata_search",
+        # Log queries
+        "fetch_logs_for_jobs": "functions.log_query",
+        # You can extend this dictionary as your toolset grows
+    }
+    return mapping.get(step)
+
+
+def build_conversation_for_prompt(
+    engine: PanDAReasoningEngine,
+    prompt: str,
+) -> Dict[str, Any]:
+    """Construct a synthetic conversation object for a given user prompt.
+
+    The returned dict has a single key 'messages' containing a list of
+    message dicts suitable for JSONL training.
+    """
+    interaction = engine.handle_text(prompt)
+    plan = interaction.reasoning.plan
+    handler_name = interaction.reasoning.handler_name
+
+    messages: List[Dict[str, Any]] = []
+
+    # 1) System message
+    system_content = (
+        "You are the AskPanDA Triage Assistant. You help ATLAS users diagnose "
+        "and understand PanDA tasks and jobs, including queue status and pilot "
+        "issues.\n"
+        "Knowledge cutoff: 2024-06\n"
+        "Reasoning: high\n"
+        "# Valid channels: analysis, commentary, final.\n"
+        "Calls to these tools must go to the commentary channel: 'functions'."
+    )
+    messages.append(
+        {
+            "role": "system",
+            "content": system_content,
+        }
+    )
+
+    # 2) Developer message
+    developer_content = (
+        "# Instructions\n"
+        "You are the AskPanDA Triage Assistant. Use the provided tool "
+        "functions to look up PanDA metadata, retrieve context, and inspect "
+        "logs before answering.\n"
+        "# Tools\n"
+        "## functions\n"
+        "namespace functions {\n"
+        "  // (Schemas are defined externally; the tool names are:\n"
+        "  //  - metadata_search\n"
+        "  //  - context_retrieve\n"
+        "  //  - log_query\n"
+        "}\n"
+    )
+    messages.append(
+        {
+            "role": "developer",
+            "content": developer_content,
+        }
+    )
+
+    # 3) User message
+    messages.append(
+        {
+            "role": "user",
+            "content": prompt,
+        }
+    )
+
+    # 4) Tool calls derived from the reasoning plan
+    # For each step in the plan that maps to a tool, we emit:
+    #   - assistant (commentary) message with name + empty arguments
+    #   - tool message with empty content
+    for step in plan:
+        tool_name = _step_to_tool_name(step)
+        if not tool_name:
+            continue
+
+        messages.append(
+            {
+                "role": "assistant",
+                "channel": "commentary",
+                "name": tool_name,
+                "arguments": {},  # arguments unknown at data-generation time
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "name": tool_name,
+                "content": "",  # tool output omitted / unknown
+            }
+        )
+
+    # 5) Final assistant message
+    # You can choose either the raw handler_output or the formatted_answer.
+    # formatted_answer includes routing and plan; handler_output is cleaner.
+    final_content = interaction.handler_output
+
+    messages.append(
+        {
+            "role": "assistant",
+            "channel": "final",
+            "content": final_content,
+        }
+    )
+
+    return {"messages": messages}
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments for the test harness.
 
@@ -265,8 +391,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             will be used.
 
     Returns:
-        argparse.Namespace: Parsed arguments with ``input`` and ``output``
-        attributes.
+        argparse.Namespace: Parsed arguments with ``input``, ``output`` and
+        ``jsonl_output`` attributes.
     """
     parser = argparse.ArgumentParser(
         description="Run automated tests for PanDAReasoningEngine.",
@@ -283,7 +409,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "written. If omitted, output is written to stdout."
         ),
     )
+    parser.add_argument(
+        "--jsonl-output",
+        help=(
+            "Optional path to a JSONL file where synthetic fine-tuning "
+            "conversations will be written. Each line will contain a single "
+            "JSON object with a 'messages' array."
+        ),
+    )
     return parser.parse_args(argv)
+
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -315,16 +450,33 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Run tests, writing detailed logs to the requested destination.
     if args.output:
         try:
-            with open(args.output, "w", encoding="utf-8") as out_file:
-                failed = run_tests(engine, prompts, out_file)
-        except OSError as exc:
+            with open(args.output, "w", encoding="utf-8") as out_f:
+                failed = run_tests(engine, prompts, out_f)
+        except OSError as exc:  # noqa: BLE001
             print(
-                f"Error writing to output file '{args.output}': {exc}",
+                f"Error opening output file '{args.output}': {exc}",
                 file=sys.stderr,
             )
             sys.exit(1)
     else:
         failed = run_tests(engine, prompts, sys.stdout)
+
+    # Optionally generate JSONL dataset for fine-tuning
+    if args.jsonl_output:
+        try:
+            with open(args.jsonl_output, "w", encoding="utf-8") as jsonl_f:
+                for prompt in prompts.keys():
+                    conv = build_conversation_for_prompt(engine, prompt)
+                    json.dump(conv, jsonl_f, ensure_ascii=False)
+                    jsonl_f.write("\n")
+        except OSError as exc:  # noqa: BLE001
+            print(
+                f"Error writing JSONL file '{args.jsonl_output}': {exc}",
+                file=sys.stderr,
+            )
+            # Do not override test failure exit code, but fail if we cannot
+            # produce the dataset.
+            sys.exit(1)
 
     # Always print a short summary report to stdout
     total = len(prompts)
@@ -335,7 +487,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # Exit with non-zero status if there were failures
     sys.exit(0 if failed == 0 else 1)
-
 
 if __name__ == "__main__":
     main()
