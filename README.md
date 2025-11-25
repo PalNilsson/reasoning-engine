@@ -214,15 +214,40 @@ expected handler as the label.
 Example JSONL entry (not complete):
 
 ```json
-{"prompt": "What is PanDA?", "completion": " DocumentQuery"}
-{"prompt": "Why did job 123456 fail?", "completion": " LogAnalysis"}
-``` 
-
+{"messages": 
+  [{"role": "system", 
+    "content": "You are the AskPanDA Triage Assistant. You help ATLAS users diagnose and understand PanDA tasks and jobs, including queue status and pilot issues.\nKnowledge cutoff: 2024-06\nReasoning: high\n# Valid channels: analysis, commentary, final.\nCalls to these tools must go to the commentary channel: 'functions'."}, 
+    {"role": "developer", 
+      "content": "# Instructions\nYou are the AskPanDA Triage Assistant. Use the provided tool functions to look up PanDA metadata, retrieve context, and inspect logs before answering.\n# Tools\n## functions\nnamespace functions {\n  // (Schemas are defined externally; the tool names are:\n  //  - metadata_search\n  //  - context_retrieve\n  //  - log_query\n}\n"}, 
+    {"role": "user", 
+      "content": "What is PanDA?"}, 
+    {"role": "assistant", 
+      "channel": "commentary", 
+      "name": "functions.context_retrieve", 
+      "arguments": {}}, 
+    {"role": "tool", 
+      "name": "functions.context_retrieve", 
+      "content": ""}, 
+    {"role": "assistant", 
+      "channel": "final", 
+      "content": "[DocumentQuery] Handling request\n  goal: Answer a documentation or how-to question about PanDA.\n  confidence: 0.60\n  entities: {'queues': ['what', 'panda']}\n  prompt: 'What is PanDA?'"
+    }
+  ]}
+..
+```
 Initial JSONL files can be created like so:
 
 ```bash
 python test_panda_reasoning_engine.py --input prompts.json --jsonl-output fine_tuning_data.json
 ```
 
+A second script can be used to loop over the prompts in the generated JSONL file and
+and query an LLM to produce a final fine-tuning dataset:
+
+```bash
+python generate_finetuning_dataset.py --input fine_tuning_data.json --output openai_finetuning.jsonl --llm openai --model gpt-4-vision-preview
+```
+
+(currently in progress, not all options are implemented and it will not contact the LLM just yet).
 
 
